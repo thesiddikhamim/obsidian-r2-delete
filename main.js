@@ -1,4 +1,4 @@
-const { Plugin, Notice, Modal, PluginSettingTab, Setting } = require("obsidian");
+const { Plugin, Notice, Modal, PluginSettingTab, Setting, FuzzySuggestModal } = require("obsidian");
 
 // Matches any embedded file: image, audio, video, pdf
 const EMBED_REGEX = /!\[.*?\]\((https?:\/\/[^\)]+)\)/g;
@@ -11,37 +11,100 @@ class R2DeletePlugin extends Plugin {
     };
 
     this.addSettingTab(new R2DeleteSettingTab(this.app, this));
+    this.addCommand({
+      id: "delete-r2-file-current-line",
+      name: "Delete R2 file(s) on current line",
+      editorCallback: async (editor) => {
+        await this.deleteEmbedsOnLine(editor, editor.getCursor().line);
+      },
+    });
+    this.addCommand({
+      id: "delete-r2-file-pick-from-note",
+      name: "Delete R2 file from current note (pick file)",
+      editorCallback: async (editor) => {
+        const entries = this.getWorkerEmbedEntriesFromEditor(editor);
+        if (!entries.length) {
+          new Notice("No R2 embeds found in this note.");
+          return;
+        }
+        new DeleteEmbedPickerModal(this.app, entries, async (entry) => {
+          await this.deleteFile(entry.url, editor, entry.lineNumber);
+        }).open();
+      },
+    });
 
     this.registerEvent(
       this.app.workspace.on("editor-menu", (menu, editor) => {
         const cursor = editor.getCursor();
-        const line = editor.getLine(cursor.line);
-
-        if (!this.settings.workerUrl) return;
-
-        // Find all embedded files on the line
-        const matches = [...line.matchAll(EMBED_REGEX)];
-        if (matches.length === 0) return;
-
-        // Only show menu if at least one URL belongs to your worker
-        const workerMatches = matches.filter(m =>
-          m[1].includes(new URL(this.settings.workerUrl).hostname)
-        );
-        if (workerMatches.length === 0) return;
+        const workerMatches = this.getWorkerMatchesFromLine(editor.getLine(cursor.line));
+        if (!workerMatches.length) return;
 
         menu.addItem((item) => {
           item
             .setTitle("Delete file from R2")
             .setIcon("trash")
             .onClick(async () => {
-              // If multiple embeds on one line, delete all of them
-              for (const match of workerMatches) {
-                await this.deleteFile(match[1], editor, cursor.line);
-              }
+              await this.deleteMatchedEmbeds(workerMatches, editor, cursor.line);
             });
         });
       })
     );
+  }
+
+  getWorkerMatchesFromLine(line) {
+    if (!this.settings.workerUrl) return [];
+
+    const matches = [...line.matchAll(EMBED_REGEX)];
+    if (matches.length === 0) return [];
+
+    let workerHostname;
+    try {
+      workerHostname = new URL(this.settings.workerUrl).hostname;
+    } catch (e) {
+      console.error("Invalid worker URL in settings:", this.settings.workerUrl, e);
+      return [];
+    }
+
+    return matches.filter((m) => m[1].includes(workerHostname));
+  }
+
+  async deleteEmbedsOnLine(editor, lineNumber) {
+    if (!this.settings.workerUrl) {
+      new Notice("Set your Worker URL first in plugin settings.");
+      return;
+    }
+
+    const line = editor.getLine(lineNumber);
+    const workerMatches = this.getWorkerMatchesFromLine(line);
+    if (!workerMatches.length) {
+      new Notice("No R2 embed found on this line.");
+      return;
+    }
+
+    await this.deleteMatchedEmbeds(workerMatches, editor, lineNumber);
+  }
+
+  getWorkerEmbedEntriesFromEditor(editor) {
+    const entries = [];
+    const lineCount = editor.lineCount();
+    for (let i = 0; i < lineCount; i++) {
+      const line = editor.getLine(i);
+      const workerMatches = this.getWorkerMatchesFromLine(line);
+      for (const match of workerMatches) {
+        entries.push({
+          lineNumber: i,
+          url: match[1],
+        });
+      }
+    }
+    return entries;
+  }
+
+  async deleteMatchedEmbeds(workerMatches, editor, lineNumber) {
+    // If multiple embeds on one line, delete all of them
+    for (const match of workerMatches) {
+      await this.deleteFile(match[1], editor, lineNumber);
+    }
   }
 
   // Extract the R2 key from a Worker URL
@@ -184,6 +247,28 @@ class ConfirmModal extends Modal {
   }
 }
 
+class DeleteEmbedPickerModal extends FuzzySuggestModal {
+  constructor(app, entries, onChoose) {
+    super(app);
+    this.entries = entries;
+    this.onChoose = onChoose;
+    this.setPlaceholder("Select an R2 embed to delete...");
+  }
+
+  getItems() {
+    return this.entries;
+  }
+
+  getItemText(item) {
+    const key = item.url.replace(/^https?:\/\/[^/]+\//, "");
+    return `Line ${item.lineNumber + 1}: ${key}`;
+  }
+
+  onChooseItem(item) {
+    this.onChoose(item);
+  }
+}
+
 class R2DeleteSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -196,7 +281,7 @@ class R2DeleteSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "R2 File Delete" });
     containerEl.createEl("p", {
-      text: "Right-click any embedded file (image, audio, video, PDF) from your Worker to delete it from R2.",
+      text: "Desktop: right-click an embed to delete. Mobile: use 'Delete R2 file from current note (pick file)' for the most reliable flow.",
     });
 
     new Setting(containerEl)
