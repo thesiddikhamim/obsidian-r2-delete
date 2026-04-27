@@ -1,5 +1,8 @@
 const { Plugin, Notice, Modal, PluginSettingTab, Setting } = require("obsidian");
 
+// Matches any embedded file: image, audio, video, pdf
+const EMBED_REGEX = /!\[.*?\]\((https?:\/\/[^\)]+)\)/g;
+
 class R2DeletePlugin extends Plugin {
   async onload() {
     this.settings = await this.loadData() || {
@@ -14,67 +17,115 @@ class R2DeletePlugin extends Plugin {
         const cursor = editor.getCursor();
         const line = editor.getLine(cursor.line);
 
-        // Match image markdown syntax
-        const match = line.match(/!\[.*?\]\((https?:\/\/[^\)]+)\)/);
-        if (!match) return;
+        if (!this.settings.workerUrl) return;
 
-        const imageUrl = match[1];
+        // Find all embedded files on the line
+        const matches = [...line.matchAll(EMBED_REGEX)];
+        if (matches.length === 0) return;
 
-        // Only show menu for images from your worker
-        if (!this.settings.workerUrl || !imageUrl.includes(this.settings.workerUrl)) return;
+        // Only show menu if at least one URL belongs to your worker
+        const workerMatches = matches.filter(m =>
+          m[1].includes(new URL(this.settings.workerUrl).hostname)
+        );
+        if (workerMatches.length === 0) return;
 
         menu.addItem((item) => {
           item
-            .setTitle("Delete image from R2")
+            .setTitle("Delete file from R2")
             .setIcon("trash")
             .onClick(async () => {
-              await this.deleteImage(imageUrl, editor, cursor.line);
+              // If multiple embeds on one line, delete all of them
+              for (const match of workerMatches) {
+                await this.deleteFile(match[1], editor, cursor.line);
+              }
             });
         });
       })
     );
   }
 
-  async deleteImage(imageUrl, editor, lineNumber) {
-    // Extract key from URL
-    // URL: https://worker.../img/images/abc123.png?t=token
-    // Key: images/abc123.png
-    const urlObj = new URL(imageUrl);
-    const key = urlObj.pathname.replace("/img/", "");
+  // Extract the R2 key from a Worker URL
+  extractKey(fileUrl) {
+    try {
+      const urlObj = new URL(fileUrl);
+      // pathname looks like /img/images/abc123.png
+      // we want: images/abc123.png
+      const key = urlObj.pathname.replace(/^\/img\//, "");
+      return key;
+    } catch (e) {
+      console.error("Failed to parse URL:", fileUrl, e);
+      return null;
+    }
+  }
+
+  async deleteFile(fileUrl, editor, lineNumber) {
+    const key = this.extractKey(fileUrl);
+    if (!key) {
+      new Notice("Could not extract file key from URL");
+      return;
+    }
 
     const confirmed = await this.confirmDelete(key);
     if (!confirmed) return;
 
     try {
-      const deleteUrl = `${this.settings.workerUrl}/img/${encodeURIComponent(key)}?t=${this.settings.secretToken}`;
+      // Encode each path segment separately to preserve slashes
+      const encodedKey = key
+        .split("/")
+        .map(segment => encodeURIComponent(segment))
+        .join("/");
+
+      const deleteUrl = `${this.settings.workerUrl}/img/${encodedKey}?t=${encodeURIComponent(this.settings.secretToken)}`;
+
+      console.log("Deleting:", deleteUrl);
 
       const response = await fetch(deleteUrl, {
         method: "DELETE",
       });
 
+      const responseText = await response.text();
+      console.log("Delete response:", response.status, responseText);
+
       if (response.ok) {
-        // Remove the entire image line from the note
+        // Remove the entire line from the note
+        const lineCount = editor.lineCount();
+        if (lineNumber < lineCount - 1) {
+          editor.replaceRange(
+            "",
+            { line: lineNumber, ch: 0 },
+            { line: lineNumber + 1, ch: 0 }
+          );
+        } else {
+          // Last line — just clear it
+          editor.replaceRange(
+            "",
+            { line: lineNumber, ch: 0 },
+            { line: lineNumber, ch: editor.getLine(lineNumber).length }
+          );
+        }
+        new Notice("✅ File deleted from R2");
+      } else if (response.status === 401) {
+        new Notice("❌ Unauthorized — check your secret token");
+      } else if (response.status === 404) {
+        new Notice("⚠️ File not found in R2 — removing line anyway");
         editor.replaceRange(
           "",
           { line: lineNumber, ch: 0 },
           { line: lineNumber + 1, ch: 0 }
         );
-        new Notice("Image deleted from R2");
       } else {
-        const text = await response.text();
-        new Notice("Delete failed: " + text);
-        console.error("Delete failed:", text);
+        new Notice(`❌ Delete failed: ${response.status} — ${responseText}`);
+        console.error("Delete failed:", response.status, responseText);
       }
     } catch (err) {
-      new Notice("Network error — check console");
-      console.error(err);
+      new Notice("❌ Network error — are you online?");
+      console.error("Network error:", err);
     }
   }
 
   confirmDelete(key) {
     return new Promise((resolve) => {
-      const modal = new ConfirmModal(this.app, key, resolve);
-      modal.open();
+      new ConfirmModal(this.app, key, resolve).open();
     });
   }
 }
@@ -88,16 +139,26 @@ class ConfirmModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h3", { text: "Delete Image?" });
+
+    contentEl.createEl("h3", { text: "Permanently delete from R2?" });
+
+    contentEl.createEl("p", { text: "File:" });
+    const code = contentEl.createEl("code", { text: this.key });
+    code.style.display = "block";
+    code.style.padding = "6px";
+    code.style.borderRadius = "4px";
+    code.style.marginBottom = "16px";
+    code.style.wordBreak = "break-all";
+
     contentEl.createEl("p", {
-      text: `This will permanently delete from R2:`
+      text: "This cannot be undone.",
+      cls: "mod-warning",
     });
-    contentEl.createEl("code", { text: this.key });
 
     const btnRow = contentEl.createDiv();
     btnRow.style.display = "flex";
     btnRow.style.gap = "10px";
-    btnRow.style.marginTop = "20px";
+    btnRow.style.marginTop = "16px";
 
     const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
     cancelBtn.onclick = () => {
@@ -105,12 +166,17 @@ class ConfirmModal extends Modal {
       this.close();
     };
 
-    const deleteBtn = btnRow.createEl("button", { text: "Delete" });
+    const deleteBtn = btnRow.createEl("button", { text: "Delete permanently" });
+    deleteBtn.addClass("mod-warning");
     deleteBtn.style.color = "red";
+    deleteBtn.style.fontWeight = "bold";
     deleteBtn.onclick = () => {
       this.callback(true);
       this.close();
     };
+
+    // Focus cancel by default for safety
+    setTimeout(() => cancelBtn.focus(), 50);
   }
 
   onClose() {
@@ -127,31 +193,37 @@ class R2DeleteSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "R2 Image Delete" });
+
+    containerEl.createEl("h2", { text: "R2 File Delete" });
+    containerEl.createEl("p", {
+      text: "Right-click any embedded file (image, audio, video, PDF) from your Worker to delete it from R2.",
+    });
 
     new Setting(containerEl)
       .setName("Worker URL")
-      .setDesc("Your Worker URL with no trailing slash")
+      .setDesc("Your Cloudflare Worker URL — no trailing slash")
       .addText(text => text
         .setPlaceholder("https://obsidian-image-worker.thesiddikhamim.workers.dev")
         .setValue(this.plugin.settings.workerUrl)
         .onChange(async (value) => {
-          this.plugin.settings.workerUrl = value.trim();
+          this.plugin.settings.workerUrl = value.trim().replace(/\/$/, "");
           await this.plugin.saveData(this.plugin.settings);
         })
       );
 
     new Setting(containerEl)
       .setName("Secret Token")
-      .setDesc("Same token you set with wrangler secret put")
-      .addText(text => text
-        .setPlaceholder("hamim2025xk92mf")
-        .setValue(this.plugin.settings.secretToken)
-        .onChange(async (value) => {
-          this.plugin.settings.secretToken = value.trim();
-          await this.plugin.saveData(this.plugin.settings);
-        })
-      );
+      .setDesc("The token you set with wrangler secret put")
+      .addText(text => {
+        text
+          .setPlaceholder("hamim2025xk92mf")
+          .setValue(this.plugin.settings.secretToken)
+          .onChange(async (value) => {
+            this.plugin.settings.secretToken = value.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          });
+        text.inputEl.type = "password";
+      });
   }
 }
 
